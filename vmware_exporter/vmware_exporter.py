@@ -94,10 +94,12 @@ class VmwareCollector():
 
         # label names and ammount will be needed later to insert labels from custom attributes
         self._labelNames = {
+            'clusters': ['cluster_name', 'dc_name'],
             'vms': ['vm_name', 'ds_name', 'host_name', 'dc_name', 'cluster_name'],
             'vm_perf': ['vm_name', 'ds_name', 'host_name', 'dc_name', 'cluster_name'],
             'vmguests': ['vm_name', 'ds_name', 'host_name', 'dc_name', 'cluster_name'],
             'snapshots': ['vm_name', 'ds_name', 'host_name', 'dc_name', 'cluster_name'],
+            'datacenters': ['dc_name'],
             'datastores': ['ds_name', 'dc_name', 'ds_cluster'],
             'hosts': ['host_name', 'dc_name', 'cluster_name'],
             'host_perf': ['host_name', 'dc_name', 'cluster_name'],
@@ -111,16 +113,28 @@ class VmwareCollector():
         # as label names, metric are going to be used modified later
         # as labels from custom attributes are going to be inserted
         self._metricNames = {
+            'clusters': [],
             'vms': [],
             'vm_perf': [],
             'hosts': [],
             'host_perf': [],
+            'datacenters': [],
             'datastores': [],
         }
 
     def _create_metric_containers(self):
         metric_list = {}
+        metric_list['clusters'] = {
+            'vmware_cluster_overall_status': GaugeMetricFamily(
+                'vmware_cluster_overall_status',
+                'Cluster overall status (gray=0, green=1, yellow=2, red=3)',
+                labels=self._labelNames['clusters']),
+        }
         metric_list['vms'] = {
+            'vmware_vm_overall_status': GaugeMetricFamily(
+                'vmware_vm_overall_status',
+                'VM overall status (gray=0, green=1, yellow=2, red=3)',
+                labels=self._labelNames['vms']),
             'vmware_vm_power_state': GaugeMetricFamily(
                 'vmware_vm_power_state',
                 'VMWare VM Power state (On / Off)',
@@ -178,7 +192,17 @@ class VmwareCollector():
                 'VMWare Snapshot creation time in seconds',
                 labels=self._labelNames['snapshots'] + ['vm_snapshot_name']),
         }
+        metric_list['datacenters'] = {
+            'vmware_datacenter_overall_status': GaugeMetricFamily(
+                'vmware_datacenter_overall_status',
+                'Datacenter overall status (gray=0, green=1, yellow=2, red=3)',
+                labels=self._labelNames['datacenters']),
+        }
         metric_list['datastores'] = {
+            'vmware_datastore_overall_status': GaugeMetricFamily(
+                'vmware_datastore_overall_status',
+                'Datastore overall status (gray=0, green=1, yellow=2, red=3)',
+                labels=self._labelNames['datastores']),
             'vmware_datastore_capacity_size': GaugeMetricFamily(
                 'vmware_datastore_capacity_size',
                 'VMWare Datasore capacity in bytes',
@@ -217,6 +241,22 @@ class VmwareCollector():
                 labels=self._labelNames['datastores'])
         }
         metric_list['hosts'] = {
+            'vmware_host_overall_status': GaugeMetricFamily(
+                'vmware_host_overall_status',
+                'Host overall status (gray=0, green=1, yellow=2, red=3)',
+                labels=self._labelNames['hosts']),
+            'vmware_host_config_status': GaugeMetricFamily(
+                'vmware_host_config_status',
+                'Host config status (gray=0, green=1, yellow=2, red=3)',
+                labels=self._labelNames['hosts']),
+            'vmware_host_config_issues': GaugeMetricFamily(
+                'vmware_host_config_issues',
+                'Host config issues count labeled by  fullFormattedMessage and userNameCaused',
+                labels=self._labelNames['hosts'] + ['fullFormattedMessage', 'userNameCaused']),
+            'vmware_host_network_system_config': GaugeMetricFamily(
+                'vmware_host_network_system_config',
+                'Network System Configuration labeled by networkConfig and networkInfo',
+                labels=self._labelNames['hosts'] + ['networkConfig', 'networkInfo']),
             'vmware_host_power_state': GaugeMetricFamily(
                 'vmware_host_power_state',
                 'VMWare Host Power state (On / Off)',
@@ -427,6 +467,9 @@ class VmwareCollector():
             tasks.append(self._vmware_get_hosts(metrics))
             tasks.append(self._vmware_get_host_perf_manager_metrics(metrics))
 
+        tasks.append(self._vmware_get_clusters(metrics))
+        tasks.append(self._vmware_get_datacenters(metrics))
+        
         yield parallelize(*tasks)
 
         yield self._vmware_disconnect()
@@ -607,7 +650,25 @@ class VmwareCollector():
             properties,
         )
         return batch
+    
+    @run_once_property
+    @defer.inlineCallbacks
+    def cluster_inventory(self):
+        logging.info("Fetching vim.ClusterComputeResource inventory")
+        start = datetime.datetime.utcnow()
+        properties = [
+        'name',
+        'overallStatus',
+        'parent',
+        ]
+        
+        clusters = yield self.batch_fetch_properties(vim.ClusterComputeResource, properties)
+        fetch_time = datetime.datetime.utcnow() - start
+        logging.info("Fetched vim.ClusterComputeResource inventory ({fetch_time})".format(fetch_time=fetch_time))
+        
+        return clusters
 
+    
     @run_once_property
     @defer.inlineCallbacks
     def datastore_inventory(self):
@@ -615,6 +676,7 @@ class VmwareCollector():
         start = datetime.datetime.utcnow()
         properties = [
             'name',
+            'overallStatus',
             'summary.capacity',
             'summary.freeSpace',
             'summary.uncommitted',
@@ -670,6 +732,10 @@ class VmwareCollector():
         properties = [
             'name',
             'parent',
+            'overallStatus',
+            'configStatus',
+            'configIssue',
+            'configManager.networkSystem',
             'summary.hardware.numCpuCores',
             'summary.hardware.cpuMhz',
             'summary.hardware.memorySize',
@@ -737,6 +803,7 @@ class VmwareCollector():
             'name',
             'runtime.host',
             'parent',
+            'overallStatus',
             'summary.config.vmPathName',
         ]
 
@@ -972,6 +1039,10 @@ class VmwareCollector():
         # content or if this is doing stealth HTTP requests
         # Right now we assume it does stealth lookups
         datacenters = yield threads.deferToThread(lambda: content.rootFolder.childEntity)
+        
+        for dc in datacenters:
+            dc['overallStatus'] = dc.overallStatus
+            
         return datacenters
 
     @run_once_property
@@ -1304,6 +1375,10 @@ class VmwareCollector():
                 labels + [datastore.get('summary.type', 'normal')],
                 1
             )
+            
+            overall_status_map = {'gray': 0, 'green': 1, 'yellow': 2, 'red': 3}
+            overall_status_value = overall_status_map.get(row['overallStatus'], 0)
+            ds_metrics['vmware_datastore_overall_status'].add_metric(labels, overall_status_value)
 
             if 'summary.accessible' in datastore:
                 ds_metrics['vmware_datastore_accessible'].add_metric(
@@ -1312,6 +1387,28 @@ class VmwareCollector():
                 )
 
         return results
+    
+    @defer.inlineCallbacks
+    def _vmware_get_clusters(self, cluster_metrics):
+        clusters = yield self.cluster_inventory
+        
+        for cluster_id, cluster in clusters.items():
+            labels = [cluster.get('name'), cluster.get('parent', {}).get('name', 'n/a')]
+            status_map = {'gray': 0, 'green': 1, 'yellow': 2, 'red': 3}
+            overall_status = status_map.get(cluster.get('overallStatus', 'unknown').lower(), 0)
+            cluster_metrics['vmware_cluster_overall_status'].add_metric(labels, overall_status)
+            
+    @defer.inlineCallbacks
+    def _vmware_get_datacenters(self, datacenter_metrics):
+        datacenters = yield self.datacenter_inventory
+        
+        for datacenter in datacenters:
+            labels = [datacenter.get('name')]
+            status_map = {'gray': 0, 'green': 1, 'yellow': 2, 'red': 3}
+            overall_status = status_map.get(datacenter.get('overallStatus', 'unknown').lower(), 0)
+            datacenter_metrics['vmware_datacenter_overall_status'].add_metric(labels, overall_status)
+
+
 
     @defer.inlineCallbacks
     def _vmware_get_vm_perf_manager_metrics(self, vm_metrics):
@@ -1621,6 +1718,12 @@ class VmwareCollector():
                         labels + [snapshot['name']],
                         snapshot['timestamp_seconds'],
                     )
+            
+            if 'overallStatus' in row:
+                overall_status_map = {'gray': 0, 'green': 1, 'yellow': 2, 'red': 3}
+                overall_status_value = overall_status_map.get(row['overallStatus'], 0)  # Default to 'gray' if unknown
+                metrics['vmware_vm_overall_status'].add_metric(labels, overall_status_value)
+
 
         logging.info("Finished vm metrics collection")
 
@@ -1830,6 +1933,24 @@ class VmwareCollector():
                     labels,
                     float(host['summary.hardware.memorySize']) / 1024 / 1024
                 )
+            
+            overall_status_map = {'gray': 0, 'green': 1, 'yellow': 2, 'red': 3}
+            overall_status_value = overall_status_map.get(row['overallStatus'], 0)
+            host_metrics['vmware_host_overall_status'].add_metric(labels, overall_status_value)
+            
+            config_status_map = {'gray': 0, 'green': 1, 'yellow': 2, 'red': 3}
+            config_status_value = config_status_map.get(row['configStatus'], 0)
+            host_metrics['vmware_host_config_status'].add_metric(labels, config_status_value)
+            
+            for issue in row['configIssue']:
+                config_issue_count = len(row['configIssue'])
+                issue_message = issue.fullFormattedMessage
+                userNameCaused = issue.userName
+                host_metrics['vmware_host_config_issue'].add_metric(labels + [issue_message, userNameCaused], config_issue_count)
+            
+            network_config = host.get('summary.config.product.version', 'unknown')
+            network_info = host.get('summary.config.product.version', 'unknown')
+            host_metrics['vmware_host_network_system_config'].add_metric(labels + [network_config, network_info], 1)
 
             config_ver = host.get('summary.config.product.version', 'unknown')
             build_ver = host.get('summary.config.product.build', 'unknown')
